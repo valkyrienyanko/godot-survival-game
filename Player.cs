@@ -13,11 +13,14 @@ public partial class Player : CharacterBody2D
 	
 	public override void _Ready()
 	{
+		MyProfiler.Begin();
 		scoreLabel = GetTree().Root.GetNode<Label>("Main/UI/ScoreLabel");
 		bulletScene = GD.Load<PackedScene>("res://Bullet.tscn");
+		MyProfiler.End();
 	}
 	public override void _PhysicsProcess(double delta)
 	{
+		MyProfiler.Begin();
 		survivalTime += (float)delta;
 		scoreLabel.Text = "Score: " + ((int)survivalTime).ToString();
 		Vector2 direction = Vector2.Zero;
@@ -48,6 +51,9 @@ public partial class Player : CharacterBody2D
 		Velocity = direction * Speed;
 
 		MoveAndSlide();
+		MyProfiler.End();
+
+		MyProfiler.Begin("Collision");
 		
 		for (int i = 0; i < GetSlideCollisionCount(); i++)
 		{
@@ -58,7 +64,17 @@ public partial class Player : CharacterBody2D
 				Die();
 			}
 		}
+
+		MyProfiler.End("Collision");
 	}
+
+    public override void _Notification(int what)
+    {
+        if (what == NotificationWMCloseRequest)
+		{
+			MyProfiler.Summary();
+		}
+    }
 
 private void Die()
 {

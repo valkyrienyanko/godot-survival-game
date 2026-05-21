@@ -14,11 +14,13 @@ public partial class Enemy: CharacterBody2D
 	
 	public override void _PhysicsProcess(double delta)
 	{
+		MyProfiler.Begin();
 		if (player == null)
 			return;
 		Vector2 direction = (player.Position - Position).Normalized();
 		Velocity = direction * Speed;
 		
 		MoveAndSlide();
+		MyProfiler.End();
 	}
 }
