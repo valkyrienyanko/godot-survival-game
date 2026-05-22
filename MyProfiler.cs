@@ -194,13 +194,6 @@ public sealed class MyProfiler
 
             StringBuilder sb = new();
 
-            string sessionLine = $"Session: {totalFrames} render frames, Physics: {Engine.PhysicsTicksPerSecond} Hz, Render: {refreshRate:F0} Hz";
-            int sessionWidth = sessionLine.Length + 2;
-            sb.AppendLine("┌" + new string('─', sessionWidth) + "┐");
-            sb.AppendLine("│ " + sessionLine + " │");
-            sb.AppendLine("└" + new string('─', sessionWidth) + "┘");
-            sb.AppendLine();
-
             foreach (SummaryGroup group in groupedEntries)
             {
                 // Header row
@@ -266,7 +259,7 @@ public sealed class MyProfiler
                     BuildHeaderCell("Rank", rankWidth),
                     BuildHeaderCell("Method (File)", methodWidth),
                     BuildHeaderCell("Frame%", frameWidth),
-                    BuildHeaderCell("Max", maxWidth)
+                    BuildHeaderCell("Max Spike", maxWidth)
                 ];
                 AppendRow(sb, "┌", "┬", "┐", [.. summaryHeaderCells]);
 
@@ -299,6 +292,47 @@ public sealed class MyProfiler
                 ];
                 AppendRow(sb, "└", "┴", "┘", [.. summarySeparatorCells]);
             }
+
+            sb.AppendLine();
+
+            // Session Summary
+            double totalCostUsPerFrame = allEntries.Sum(e => e.GetTotal()) / totalFrames;
+            double totalCostMs = totalCostUsPerFrame / 1000.0;
+            double frameBudgetMs = 1000.0 / refreshRate;
+            double totalFramePercent = allEntries.Sum(e => e.GetFramePercent(totalFrames, refreshRate));
+
+            Entry worstEntry = allEntries.MaxBy(e => e.GetMax());
+            string worstSpikeLine = worstEntry is not null
+                ? $"{worstEntry.MethodName}{(string.IsNullOrWhiteSpace(worstEntry.Id) ? "" : $" [{worstEntry.Id}]")} ({worstEntry.FileName}.cs) – {FormatValue(worstEntry.GetMax())} ({worstEntry.GetCount()} occurrence)"
+                : "None";
+
+            string sessionInfoLine = $"{totalFrames} frames ({totalFrames / refreshRate:F1}s), Physics {Engine.PhysicsTicksPerSecond} Hz, Render {refreshRate:F0} Hz";
+            string costLine = $"Total frame time: {totalFramePercent:F2}% ({totalCostMs:F2} ms / {frameBudgetMs:F2} ms)";
+
+            List<string> footerContent = [sessionInfoLine, costLine];
+            int maxContentWidth = footerContent.Max(l => l.Length);
+
+            string title = " Session Summary ";
+            int titleLength = title.Length;
+
+            // Minimum box width to have "┌── Title ──┐" (4 for "┌── ", title, at least 2 dashes, 1 for "┐")
+            int minBoxWidth = 7 + titleLength; // 4 + titleLength + 2 + 1
+            int boxWidth = Math.Max(maxContentWidth + 4, minBoxWidth); // +4 for "│ " and " │"
+
+            // Top border: "┌── Title ─────...─┐" exactly boxWidth chars
+            int dashesAfterTitle = boxWidth - 5 - titleLength; // 4 for "┌── ", 1 for "┐"
+            string topBorder = "┌── " + title + new string('─', dashesAfterTitle) + "┐";
+            sb.AppendLine(topBorder);
+
+            // Content rows
+            foreach (string line in footerContent)
+            {
+                sb.AppendLine("│ " + line.PadRight(boxWidth - 4) + " │");
+            }
+
+            // Bottom border
+            string bottomBorder = "└" + new string('─', boxWidth - 2) + "┘";
+            sb.AppendLine(bottomBorder);
 
             return sb.ToString();
         }
