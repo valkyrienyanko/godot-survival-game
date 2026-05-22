@@ -8,13 +8,11 @@ using System.Text;
 using Godot;
 
 /// <summary>
-/// Lightweight profiling helper that aggregates timings per call site.
+/// Profiling helper that logs timings per call site.
 /// </summary>
 public sealed class MyProfiler
 {
     private static readonly Dictionary<string, Entry> _entries = [];
-    private static readonly Formatter _formatter = new();
-    private static readonly bool _logEverythingInMs;
 
     /// <summary>
     /// Starts timing for a call site and creates its entry on first use.
@@ -24,7 +22,6 @@ public sealed class MyProfiler
         [CallerMemberName] string methodName = "")
     {
         string internalId = id + filePath + methodName;
-        // Create a new entry the first time this call site is seen.
         if (!_entries.TryGetValue(internalId, out Entry entry))
         {
             Entry newEntry = new(filePath, methodName, id);
@@ -43,7 +40,6 @@ public sealed class MyProfiler
         [CallerMemberName] string methodName = "")
     {
         string internalId = id + filePath + methodName;
-        // Only stop timers that have been started for this call site.
         if (_entries.TryGetValue(internalId, out Entry entry))
         {
             entry.Stop();
@@ -55,11 +51,14 @@ public sealed class MyProfiler
     /// </summary>
     public static void Summary()
     {
-        GD.Print(_formatter.BuildSummary(_entries.Values));
+        int totalFrames = (int)Engine.GetProcessFrames();
+        double refreshRate = DisplayServer.ScreenGetRefreshRate();
+        double targetFps = refreshRate > 0 ? refreshRate : 60;
+        GD.Print(Formatter.BuildSummary(_entries.Values, totalFrames, targetFps));
     }
 
     /// <summary>
-    /// Stores timing samples for a single call site.
+    /// Stores timing samples for a single call site in microseconds.
     /// </summary>
     private sealed class Entry(string filePath, string methodName, string id)
     {
@@ -68,46 +67,42 @@ public sealed class MyProfiler
         public string Id { get; } = id;
 
         private readonly Stopwatch _stopwatch = new();
-        private readonly List<double> _times = new();
+        private readonly List<double> _times = [];
 
-        /// <summary>
-        /// Restarts the underlying stopwatch for this entry.
-        /// </summary>
-        public void Restart() => _stopwatch.Restart();
-
-        /// <summary>
-        /// Stops the stopwatch and records the elapsed time in microseconds.
-        /// </summary>
         public void Stop()
         {
             _stopwatch.Stop();
             _times.Add(_stopwatch.Elapsed.TotalMicroseconds);
         }
-
-        /// <summary>
-        /// Returns the number of samples recorded.
-        /// </summary>
+        public void Restart() => _stopwatch.Restart();
         public int GetCount() => _times.Count;
-
-        /// <summary>
-        /// Returns the average time in microseconds.
-        /// </summary>
         public double GetAvg() => _times.Count > 0 ? _times.Average() : 0;
-
-        /// <summary>
-        /// Returns the minimum time in microseconds.
-        /// </summary>
         public double GetMin() => _times.Count > 0 ? _times.Min() : 0;
-
-        /// <summary>
-        /// Returns the maximum time in microseconds.
-        /// </summary>
         public double GetMax() => _times.Count > 0 ? _times.Max() : 0;
-
-        /// <summary>
-        /// Returns the total time in microseconds.
-        /// </summary>
         public double GetTotal() => _times.Sum();
+        public double GetCallsPerFrame(int totalFrames) => totalFrames > 0 ? (double)GetCount() / totalFrames : 0;
+        public double GetPercentile(double percentile)
+        {
+            if (_times.Count == 0) return 0;
+            if (percentile <= 0) return GetMin();
+            if (percentile >= 100) return GetMax();
+
+            List<double> sorted = [.. _times.OrderBy(x => x)];
+            int index = (int)Math.Ceiling(percentile / 100.0 * sorted.Count) - 1;
+            index = Math.Clamp(index, 0, sorted.Count - 1);
+
+            return sorted[index];
+        }
+        public double GetFramePercent(int totalFrames, double refreshRate)
+        {
+            if (totalFrames <= 0) return 0.0;
+
+            double totalUs = GetTotal();
+            double avgUsPerFrame = totalUs / totalFrames;
+            double budgetUs = 1_000_000 / refreshRate; // 16,667 µs for 60 FPS
+
+            return avgUsPerFrame / budgetUs * 100.0;
+        }
     }
 
     /// <summary>
@@ -115,99 +110,223 @@ public sealed class MyProfiler
     /// </summary>
     private sealed class Formatter
     {
-        // Width of the method-name column inside the table borders, in characters.
-        private const int MethodColumnWidth = 37;
-        // Width of each Avg/Min/Max column inside the table borders, in characters.
         private const int MetricColumnWidth = 9;
-        // Width of the Total column inside the table borders, in characters.
-        private const int TotalColumnWidth = 11;
-        // Number of leading spaces added before method names in the method column.
         private const int MethodIndentSpaces = 4;
+        private const int ExtraWidthOnLastColumn = 2;
+        private const Metric LoggedMetric = Metric.Milliseconds;
+        private static readonly Alignment CellAlignment = Alignment.Center;
 
-        /// <summary>
-        /// Groups entries by file and captures an average time used for ordering.
-        /// </summary>
-        private sealed class SummaryGroup(
-            string fileName, 
-            List<Entry> methods, 
-            double averageTime)
+        private enum Metric
+        {
+            Milliseconds,
+            Microseconds,
+            Nanoseconds
+        }
+
+        private enum Alignment
+        {
+            Left,
+            Center,
+            Right
+        }
+
+        private sealed class Column(
+            string header, 
+            Func<Entry, double> valueGetter, 
+            Func<double, string> formatter, 
+            int minWidth)
+        {
+            public string Header { get; } = header;
+            public Func<Entry, double> ValueGetter { get; } = valueGetter;
+            public Func<double, string> Formatter { get; } = formatter;
+            public int MinWidth { get; } = minWidth;
+        }
+
+        private static List<Column> GetColumns(int totalFrames, double targetFps) =>
+        [
+            new Column("Calls", e => e.GetCount(), FormatCount, MetricColumnWidth),
+            new Column("Calls/f", e => e.GetCallsPerFrame(totalFrames), v => $"{v:F1}", MetricColumnWidth),
+            new Column("Avg", e => e.GetAvg(), FormatValue, MetricColumnWidth),
+            new Column("Max", e => e.GetMax(), FormatValue, MetricColumnWidth),
+            new Column("P99", e => e.GetPercentile(99), FormatValue, MetricColumnWidth),
+            new Column("P99.9", e => e.GetPercentile(99.9), FormatValue, MetricColumnWidth),
+            new Column("Frame%", e => e.GetFramePercent(totalFrames, targetFps), v => $"{v:F2} %", MetricColumnWidth),
+        ];
+
+        private sealed class SummaryGroup(string fileName, List<Entry> methods, double averageTime)
         {
             public string FileName { get; } = fileName;
             public List<Entry> Methods { get; } = methods;
             public double AverageTime { get; } = averageTime;
         }
 
-        /// <summary>
-        /// Builds a formatted table summary for the given entries.
-        /// </summary>
-        public string BuildSummary(IEnumerable<Entry> entries)
+        public static string BuildSummary(IEnumerable<Entry> entries, int totalFrames, double refreshRate)
         {
-            List<Entry> entryList = entries.ToList();
+            List<Entry> entryList = [.. entries];
+            List<Column> columns = GetColumns(totalFrames, refreshRate);
 
-            List<SummaryGroup> groupedEntries = entryList
+            List<SummaryGroup> groupedEntries = [.. entryList
                 .GroupBy(e => e.FileName)
                 .Select(g =>
                 {
-                    List<Entry> methods = g.OrderByDescending(m => m.GetAvg()).ToList();
+                    List<Entry> methods = [.. g.OrderByDescending(m => m.GetAvg())];
                     double totalTime = g.Sum(m => m.GetTotal());
                     int totalSamples = g.Sum(m => m.GetCount());
                     double averageTime = totalSamples > 0 ? totalTime / totalSamples : 0;
                     return new SummaryGroup(g.Key, methods, averageTime);
                 })
-                .OrderByDescending(g => g.AverageTime)
-                .ToList();
+                .OrderByDescending(g => g.AverageTime)];
 
-            // Skip output when no entries have been recorded.
             if (groupedEntries.Count == 0)
             {
                 return string.Empty;
             }
 
-            int avgWidth = GetColumnWidth("Avg", MetricColumnWidth, entryList, m => FormatTime(m.GetAvg()));
-            int minWidth = GetColumnWidth("Min", MetricColumnWidth, entryList, m => FormatTime(m.GetMin()));
-            int maxWidth = GetColumnWidth("Max", MetricColumnWidth, entryList, m => FormatTime(m.GetMax()));
-            int totalWidth = GetColumnWidth("Total", TotalColumnWidth, entryList, m => FormatTotal(m.GetTotal()));
+            // Dynamically calculate best width for method column
+            int methodColumnWidth = CalculateMethodColumnWidth(entryList);
+
+            List<int> columnWidths = [.. columns.Select(c =>
+                GetColumnWidth(c.Header, c.MinWidth, entryList, e => c.Formatter(c.ValueGetter(e))))];
+
+            // Last column is slightly wider
+            if (columnWidths.Count > 0)
+                columnWidths[^1] += ExtraWidthOnLastColumn;
 
             StringBuilder sb = new();
 
-            foreach (var group in groupedEntries)
-            {
-                AppendRow(sb, "┌", "┬", "┐",
-                    BuildSectionTitleCell(group.FileName, MethodColumnWidth),
-                    BuildHeaderCell("Avg", avgWidth),
-                    BuildHeaderCell("Min", minWidth),
-                    BuildHeaderCell("Max", maxWidth),
-                    BuildHeaderCell("Total", totalWidth));
+            string sessionLine = $"Session: {totalFrames} render frames, Physics: {Engine.PhysicsTicksPerSecond} Hz, Render: {refreshRate:F0} Hz";
+            int sessionWidth = sessionLine.Length + 2;
+            sb.AppendLine("┌" + new string('─', sessionWidth) + "┐");
+            sb.AppendLine("│ " + sessionLine + " │");
+            sb.AppendLine("└" + new string('─', sessionWidth) + "┘");
+            sb.AppendLine();
 
-                foreach (var m in group.Methods)
+            foreach (SummaryGroup group in groupedEntries)
+            {
+                // Header row
+                List<string> headerCells =
+                [
+                    BuildSectionTitleCell(group.FileName, methodColumnWidth),
+                    .. columnWidths.Select((w, i) => BuildHeaderCell(columns[i].Header, w)),
+                ];
+                AppendRow(sb, "┌", "┬", "┐", [.. headerCells]);
+
+                // Data rows
+                foreach (Entry m in group.Methods)
                 {
-                    AppendRow(sb, "│", "│", "│",
-                        BuildMethodCell(m),
-                        BuildValueCell(FormatTime(m.GetAvg()), avgWidth),
-                        BuildValueCell(FormatTime(m.GetMin()), minWidth),
-                        BuildValueCell(FormatTime(m.GetMax()), maxWidth),
-                        BuildValueCell(FormatTotal(m.GetTotal()), totalWidth));
+                    List<string> valueCells =
+                    [
+                        BuildMethodCell(m, methodColumnWidth),
+                        .. columnWidths.Select((w, i) => BuildValueCell(columns[i].Formatter(columns[i].ValueGetter(m)), w)),
+                    ];
+                    AppendRow(sb, "│", "│", "│", [.. valueCells]);
                 }
 
-                AppendRow(sb, "└", "┴", "┘",
-                    BuildSeparatorCell(MethodColumnWidth),
-                    BuildSeparatorCell(avgWidth),
-                    BuildSeparatorCell(minWidth),
-                    BuildSeparatorCell(maxWidth),
-                    BuildSeparatorCell(totalWidth));
+                // Separator row
+                List<string> separatorCells = [BuildSeparatorCell(methodColumnWidth), .. columnWidths.Select(BuildSeparatorCell)];
+                AppendRow(sb, "└", "┴", "┘", [.. separatorCells]);
 
                 if (!ReferenceEquals(group, groupedEntries[^1]))
                 {
                     sb.AppendLine();
                 }
             }
+            
+            sb.AppendLine();
+
+            // Final Summary Table
+            List<Entry> allEntries = [.. entryList
+                .OrderByDescending(e => e.GetFramePercent(totalFrames, refreshRate))
+                .ThenByDescending(e => e.GetMax())];
+
+            if (allEntries.Count > 0)
+            {
+                // Determine required column widths from content
+                int rankWidth = 6; // " Rank "
+                int frameWidth = GetColumnWidth("Frame%", MetricColumnWidth, allEntries,
+                    e => $"{e.GetFramePercent(totalFrames, refreshRate):F2}%");
+                int maxWidth = GetColumnWidth("Max Spike", MetricColumnWidth, allEntries,
+                    e => FormatValue(e.GetMax()));
+
+                // Build the full display name for every entry to measure method column width
+                int methodWidth = " Method (File) ".Length;
+                foreach (Entry e in allEntries)
+                {
+                    string suffix = string.IsNullOrWhiteSpace(e.Id) ? string.Empty : $" [{e.Id}]";
+                    string display = $"{e.MethodName}{suffix} ({e.FileName}.cs)";
+                    if (display.Length + 2 > methodWidth) // +2 for surrounding spaces
+                        methodWidth = display.Length + 2;
+                }
+                // Add a bit of breathing room
+                methodWidth += 4;
+
+                // Header row
+                List<string> summaryHeaderCells =
+                [
+                    BuildHeaderCell("Rank", rankWidth),
+                    BuildHeaderCell("Method (File)", methodWidth),
+                    BuildHeaderCell("Frame%", frameWidth),
+                    BuildHeaderCell("Max", maxWidth)
+                ];
+                AppendRow(sb, "┌", "┬", "┐", [.. summaryHeaderCells]);
+
+                // Data rows
+                for (int i = 0; i < allEntries.Count; i++)
+                {
+                    Entry e = allEntries[i];
+                    string rank = $"{i + 1}";
+
+                    string suffix = string.IsNullOrWhiteSpace(e.Id) ? string.Empty : $" [{e.Id}]";
+                    string methodDisplay = $"{e.MethodName}{suffix} ({e.FileName})";
+
+                    List<string> valueCells =
+                    [
+                        BuildValueCell(rank, rankWidth),
+                        BuildLeftValueCell(methodDisplay, methodWidth), // left‑aligned
+                        BuildValueCell($"{e.GetFramePercent(totalFrames, refreshRate):F2}%", frameWidth),
+                        BuildValueCell(FormatValue(e.GetMax()), maxWidth)
+                    ];
+                    AppendRow(sb, "│", "│", "│", [.. valueCells]);
+                }
+
+                // Separator row
+                List<string> summarySeparatorCells =
+                [
+                    BuildSeparatorCell(rankWidth),
+                    BuildSeparatorCell(methodWidth),
+                    BuildSeparatorCell(frameWidth),
+                    BuildSeparatorCell(maxWidth)
+                ];
+                AppendRow(sb, "└", "┴", "┘", [.. summarySeparatorCells]);
+            }
 
             return sb.ToString();
         }
 
-        /// <summary>
-        /// Appends a table row with borders and cell contents.
-        /// </summary>
+        private static string BuildLeftValueCell(string value, int width)
+        {
+            if (width <= 0) return string.Empty;
+            int innerWidth = Math.Max(0, width - 2);
+            string trimmed = value.Length > innerWidth ? value[..innerWidth] : value;
+            return " " + trimmed.PadRight(innerWidth) + " ";
+        }
+
+        private static int CalculateMethodColumnWidth(IEnumerable<Entry> entries)
+        {
+            int maxWidth = 20; // Reasonable minimum
+
+            foreach (Entry e in entries)
+            {
+                string suffix = string.IsNullOrWhiteSpace(e.Id) ? string.Empty : $" [{e.Id}]";
+                string fullName = e.MethodName + suffix;
+                if (fullName.Length > maxWidth)
+                    maxWidth = fullName.Length;
+            }
+
+            // Add some padding for indentation and readability
+            return maxWidth + MethodIndentSpaces + 4;
+        }
+
         private static void AppendRow(StringBuilder sb, string left, string middle, string right, params string[] cells)
         {
             sb.Append(left);
@@ -219,69 +338,37 @@ public sealed class MyProfiler
             sb.AppendLine();
         }
 
-        /// <summary>
-        /// Builds the section title cell for a file group.
-        /// </summary>
         private static string BuildSectionTitleCell(string title, int width)
         {
-            // Avoid building cells with non-positive width.
-            if (width <= 0)
-                return string.Empty;
-
+            if (width <= 0) return string.Empty;
             string prefix = $"── {title} ";
-            
-            // Clamp the title to the column width when it would overflow.
-            if (prefix.Length >= width)
-            {
-                return prefix.Length > width ? prefix[..width] : prefix;
-            }
-
+            if (prefix.Length >= width) return prefix.Length > width ? prefix[..width] : prefix;
             return prefix + new string('─', width - prefix.Length);
         }
 
-        /// <summary>
-        /// Builds a centered header cell for a column.
-        /// </summary>
         private static string BuildHeaderCell(string title, int width)
         {
-            // Avoid building cells with non-positive width.
-            if (width <= 0)
-                return string.Empty;
-
+            if (width <= 0) return string.Empty;
             string label = $" {title} ";
-            // Clamp the header to the column width when it would overflow.
-            if (label.Length >= width)
-            {
-                return label.Length > width ? label[..width] : label;
-            }
-
+            if (label.Length >= width) return label.Length > width ? label[..width] : label;
             int dashCount = width - label.Length;
             int left = dashCount / 2;
             int right = dashCount - left;
             return new string('─', left) + label + new string('─', right);
         }
 
-        /// <summary>
-        /// Builds a separator cell filled with horizontal rules.
-        /// </summary>
         private static string BuildSeparatorCell(int width) => width > 0 ? new string('─', width) : string.Empty;
 
-        /// <summary>
-        /// Builds the method-name cell with indentation and id suffix.
-        /// </summary>
-        private static string BuildMethodCell(Entry entry)
+        private static string BuildMethodCell(Entry entry, int methodColumnWidth)
         {
-            int indent = Math.Min(MethodIndentSpaces, MethodColumnWidth);
-            int nameWidth = Math.Max(0, MethodColumnWidth - indent);
+            int indent = Math.Min(MethodIndentSpaces, methodColumnWidth);
+            int nameWidth = Math.Max(0, methodColumnWidth - indent);
             string suffix = string.IsNullOrWhiteSpace(entry.Id) ? string.Empty : $" [{entry.Id}]";
             string displayName = entry.MethodName + suffix;
             string name = displayName.Length > nameWidth ? displayName[..nameWidth] : displayName;
             return new string(' ', indent) + name.PadRight(nameWidth);
         }
 
-        /// <summary>
-        /// Determines a column width that fits the header and all formatted values.
-        /// </summary>
         private static int GetColumnWidth(string header, int minWidth, IEnumerable<Entry> methods, Func<Entry, string> formatter)
         {
             int width = Math.Max(minWidth, $" {header} ".Length);
@@ -297,59 +384,38 @@ public sealed class MyProfiler
             return width;
         }
 
-        /// <summary>
-        /// Builds a centered value cell with padding.
-        /// </summary>
         private static string BuildValueCell(string value, int width)
         {
-            // Avoid building cells with non-positive width.
             if (width <= 0)
                 return string.Empty;
 
             int innerWidth = Math.Max(0, width - 2);
-            // Clamp the value to the column width when it would overflow.
             string trimmed = value.Length > innerWidth ? value[..innerWidth] : value;
-            return " " + trimmed.PadRight(innerWidth) + " ";
+
+            string aligned = CellAlignment switch
+            {
+                Alignment.Left   => trimmed.PadRight(innerWidth),
+                Alignment.Right  => trimmed.PadLeft(innerWidth),
+                _                => trimmed.PadLeft((innerWidth + trimmed.Length) / 2).PadRight(innerWidth) // Center
+            };
+
+            return " " + aligned + " ";
         }
 
-        /// <summary>
-        /// Formats a single time value in ms/us/ns based on the configured unit mode.
-        /// </summary>
-        private static string FormatTime(double us)
+        private static string FormatCount(double count)
         {
-            return FormatValue(us, includeUnitPadding: true);
+            return ((int)count).ToString("N0");
         }
 
-        /// <summary>
-        /// Formats a total time value in ms/us/ns with aligned units.
-        /// </summary>
-        private static string FormatTotal(double us)
+        private static string FormatValue(double us)
         {
-            return FormatValue(us, includeUnitPadding: true);
-        }
-
-        /// <summary>
-        /// Formats a time value in ms/us/ns based on the configured unit mode.
-        /// </summary>
-        private static string FormatValue(double us, bool includeUnitPadding)
-        {
-            string spacer = includeUnitPadding ? " " : string.Empty;
-            if (_logEverythingInMs)
+            return LoggedMetric switch
             {
-                return $"{us / 1000:F1}{spacer}ms";
-            }
-
-            if (us >= 1000)
-            {
-                return $"{us / 1000:F1}{spacer}ms";
-            }
-
-            if (us >= 1)
-            {
-                return $"{us:F1}{spacer}us";
-            }
-
-            return $"{us * 1000:F1}{spacer}ns";
+                Metric.Milliseconds => $"{us / 1000.0:F3} ms",
+                Metric.Microseconds => $"{us:F1} µs",
+                Metric.Nanoseconds => $"{us * 1000.0:F0} ns",
+                _ => $"{us:F1} µs"
+            };
         }
     }
 }
